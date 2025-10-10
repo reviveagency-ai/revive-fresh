@@ -1,151 +1,140 @@
-// api/rollup.ts
-import type { VercelRequest, VercelResponse } from '@vercel/node';
+// api/rollup.ts — Vercel serverless function
+import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-const HL = 'https://services.leadconnectorhq.com';
+const HL_BASE = "https://services.leadconnectorhq.com";
 
-async function hl<T = any>(path: string, init: RequestInit = {}) {
+/** LeadConnector requires a Version header on ALL calls.
+ *  Most endpoints also behave better if LocationId is sent as a HEADER.
+ */
+async function hl<T = any>(
+  path: string,
+  init: RequestInit & { locationId?: string } = {}
+): Promise<T> {
   const token = process.env.HL_API_TOKEN!;
-  const headers = {
+  if (!token) throw new Error("Missing HL_API_TOKEN env");
+
+  const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
-    'Content-Type': 'application/json',
-    ...(init.headers || {})
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    Version: "2021-07-28", // REQUIRED by LeadConnector/HighLevel
+    ...(init.headers as Record<string, string> | undefined),
   };
-  const resp = await fetch(`${HL}${path}`, { ...init, headers });
+  // Also pass LocationId as a header whenever we know it
+  if (init.locationId) headers["LocationId"] = init.locationId;
+
+  const resp = await fetch(`${HL_BASE}${path}`, { ...init, headers });
   if (!resp.ok) {
-    const txt = await resp.text().catch(() => '');
-    throw new Error(`HL ${path} ${resp.status}: ${txt}`.slice(0, 500));
+    const txt = await resp.text().catch(() => "");
+    throw new Error(`HL ${path} ${resp.status}: ${txt}`.slice(0, 800));
   }
-  return resp.json() as Promise<T>;
+  return (await resp.json()) as T;
 }
 
 async function postToSlack(channel: string, text: string) {
   const token = process.env.SLACK_BOT_TOKEN!;
-  const resp = await fetch('https://slack.com/api/chat.postMessage', {
-    method: 'POST',
+  if (!token) throw new Error("Missing SLACK_BOT_TOKEN env");
+  const resp = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
-      'Content-type': 'application/json; charset=utf-8',
+      "Content-type": "application/json; charset=utf-8",
     },
-    body: JSON.stringify({ channel, text, unfurl_links: false, unfurl_media: false }),
+    body: JSON.stringify({
+      channel,
+      text,
+      unfurl_links: false,
+      unfurl_media: false,
+    }),
   });
   return resp.json();
 }
 
-function getRangeLast7Days() {
+function rangeLast7() {
   const now = new Date();
-  const end = new Date(now);                // now
-  const start = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000); // 7 days ago
-  // HL expects ISO strings
-  return {
-    startISO: start.toISOString(),
-    endISO: end.toISOString(),
-    label: `${start.toISOString().slice(0,10)}–${end.toISOString().slice(0,10)}`
-  };
+  const end = now;
+  const start = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const startISO = start.toISOString();
+  const endISO = end.toISOString();
+  const label = `${startISO.slice(0, 10)}–${endISO.slice(0, 10)}`;
+  return { startISO, endISO, label };
 }
 
 type Pipeline = { id: string; name: string };
-type LocationSummary = {
-  locationId: string;
-  clientName: string;        // best-effort (may be blank if not mapped)
-  totals: { newLeads: number };
-  pipelines: Array<{ name: string; id: string; newLeads: number }>;
-  errors?: string[];
-};
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const dry = req.query.dry_run === '1';
-  const doLivePost = req.query.post === 'live';
-  const channel = process.env.SLACK_CHANNEL_MASTER || '';
-  const locs = (process.env.RYZE_LOCATION_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-  const { startISO, endISO, label } = getRangeLast7Days();
+  try {
+    const dry = req.query.dry_run === "1";
+    const doLivePost = req.query.post === "live";
+    const channel = process.env.SLACK_CHANNEL_MASTER || "";
+    const locs = (process.env.RYZE_LOCATION_IDS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
 
-  const results: LocationSummary[] = [];
-  for (const loc of locs) {
-    const summary: LocationSummary = {
-      locationId: loc,
-      clientName: '', // (optional: map if you keep a CSV env; we’ll fill later)
-      totals: { newLeads: 0 },
-      pipelines: [],
-      errors: []
-    };
-    try {
-      // 1) Pipelines
-      const pipes: Pipeline[] = await hl(`/opportunities/pipelines?locationId=${encodeURIComponent(loc)}`);
+    const { startISO, endISO, label } = rangeLast7();
 
-      // 2) Count opportunities created in window per pipeline
-      for (const p of pipes) {
-        try {
-          // Some HL tenants require POST for searching; we try POST first, fallback to GET.
-          let data: any;
+    const results: Array<{
+      locationId: string;
+      clientName: string;
+      totals: { newLeads: number };
+      pipelines: Array<{ id: string; name: string; newLeads: number }>;
+      errors?: string[];
+    }> = [];
+
+    for (const loc of locs) {
+      const summary = {
+        locationId: loc,
+        clientName: "", // optional: map later
+        totals: { newLeads: 0 },
+        pipelines: [] as Array<{ id: string; name: string; newLeads: number }>,
+        errors: [] as string[],
+      };
+
+      try {
+        // 1) Pipelines — send both query param and LocationId header
+        const pipes: Pipeline[] = await hl(
+          `/opportunities/pipelines?locationId=${encodeURIComponent(loc)}`,
+          { locationId: loc }
+        );
+
+        // 2) For each pipeline, count opportunities created in the last 7 days
+        for (const p of pipes) {
           try {
-            data = await hl(`/opportunities/search`, {
-              method: 'POST',
-              body: JSON.stringify({
+            // Preferred POST search (with LocationId header)
+            let data: any;
+            try {
+              data = await hl(`/opportunities/search`, {
+                method: "POST",
                 locationId: loc,
-                pipelineId: p.id,
-                createdAtStart: startISO,
-                createdAtEnd: endISO,
-                limit: 1 // minimize payload; we'll read total if provided
-              }),
-            });
-          } catch (_e) {
-            // Fallback GET (if supported on your account)
-            data = await hl(
-              `/opportunities/search?locationId=${encodeURIComponent(loc)}&pipelineId=${encodeURIComponent(p.id)}&createdAtStart=${encodeURIComponent(startISO)}&createdAtEnd=${encodeURIComponent(endISO)}&limit=1`
-            );
-          }
+                body: JSON.stringify({
+                  locationId: loc,
+                  pipelineId: p.id,
+                  createdAtStart: startISO,
+                  createdAtEnd: endISO,
+                  limit: 1, // minimize payload; we only need totals
+                }),
+              });
+            } catch {
+              // Fallback GET (still include LocationId header)
+              data = await hl(
+                `/opportunities/search?locationId=${encodeURIComponent(
+                  loc
+                )}&pipelineId=${encodeURIComponent(
+                  p.id
+                )}&createdAtStart=${encodeURIComponent(
+                  startISO
+                )}&createdAtEnd=${encodeURIComponent(endISO)}&limit=1`,
+                { locationId: loc }
+              );
+            }
 
-          // Try common shapes: { total } or { meta: { total } } or array.length
-          const total =
-            (typeof data?.total === 'number' && data.total) ||
-            (typeof data?.meta?.total === 'number' && data.meta.total) ||
-            (Array.isArray(data) ? data.length : 0);
+            const total =
+              (typeof data?.total === "number" && data.total) ||
+              (typeof data?.meta?.total === "number" && data.meta.total) ||
+              (Array.isArray(data) ? data.length : 0);
 
-          summary.pipelines.push({ name: p.name, id: p.id, newLeads: total });
-          summary.totals.newLeads += total;
-        } catch (e:any) {
-          summary.errors?.push(`Count fail for pipeline ${p.name}: ${e.message || e}`);
-        }
-      }
-    } catch (e:any) {
-      summary.errors?.push(`Pipelines fetch failed: ${e.message || e}`);
-    }
-    results.push(summary);
-  }
-
-  const payload = {
-    ok: true,
-    range: label,
-    endpoint: '/api/rollup',
-    channel: channel || '(unset)',
-    locationsProcessed: results.length,
-    results
-  };
-
-  if (dry) return res.status(200).json(payload);
-
-  // Format a compact Slack message
-  const lines: string[] = [];
-  lines.push(`:bar_chart: Weekly RYZE Rollup — ${label}`);
-  for (const r of results) {
-    const name = r.clientName || r.locationId;
-    lines.push(`\n*${name}*`);
-    lines.push(`Totals: *${r.totals.newLeads}* new`);
-    if (r.pipelines.length) {
-      for (const p of r.pipelines) {
-        lines.push(`• ${p.name}: ${p.newLeads} new`);
-      }
-    }
-    if (r.errors && r.errors.length) {
-      lines.push(`⚠️ ${r.errors.join(' | ')}`);
-    }
-  }
-  const text = lines.join('\n');
-
-  if (doLivePost && channel) {
-    const r = await postToSlack(channel, text);
-    return res.status(200).json({ ...payload, posted: r });
-  }
-
-  return res.status(200).json({ ...payload, message: "Append ?post=live to send this to Slack once you're happy." });
-}
+            summary.pipelines.push({ id: p.id, name: p.name, newLeads: total });
+            summary.totals.newLeads += total;
+          } catch (e: any) {
+            summary.errors?.push(

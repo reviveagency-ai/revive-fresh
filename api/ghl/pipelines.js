@@ -38,11 +38,12 @@ module.exports = async (req, res) => {
       data = await r.json();
     } catch (parseErr) {
       console.error("JSON_PARSE_ERROR:", parseErr);
+      const text = await r.text().catch(() => "<no-body>");
       return res.status(r.ok ? 200 : r.status).json({
         ok: r.ok,
         status: r.status,
         error: "Failed to parse JSON from GHL",
-        bodyText: await r.text().catch(() => "<no-body>")
+        bodyText: text
       });
     }
 

@@ -1,55 +1,48 @@
 // api/ghl/pipelines.js
 const { getAuth, getLocationIdFromReq } = require("../_config");
 
+async function callPipelines(url, token, isJWT, locationId) {
+  // JWT (Agency OAuth) -> LeadConnector host + Location-Id header
+  if (isJWT) {
+    return fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Location-Id": locationId,
+        Version: "2021-07-28",
+        Accept: "application/json"
+      }
+    });
+  }
+
+  // API Key (Location key) -> REST host; try Bearer then X-API-KEY
+  let r = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}`, Version: "2021-07-28", Accept: "application/json" }
+  });
+  if (r.status === 401) {
+    r = await fetch(url, {
+      headers: { "X-API-KEY": token, Version: "2021-07-28", Accept: "application/json" }
+    });
+  }
+  return r;
+}
+
 module.exports = async (req, res) => {
   try {
-    const auth = getAuth();
-    if (!auth.ok) {
-      console.error("AUTH_ERROR:", auth.error);
-      return res.status(500).json({ ok: false, error: auth.error });
-    }
+    const auth = getAuth(); // decides host based on token type
+    if (!auth.ok) return res.status(500).json({ ok:false, error:auth.error });
 
     const locationId = getLocationIdFromReq(req);
     if (!locationId) {
-      console.error("MISSING_LOCATION_ID");
-      return res.status(400).json({
-        ok: false,
-        error: "Missing locationId. Use ?loc=<alias> or set DEFAULT_LOCATION_ID / LOCATION_IDS."
-      });
+      return res.status(400).json({ ok:false, error:"Missing locationId. Use ?loc=<alias> or set DEFAULT_LOCATION_ID / LOCATION_IDS." });
     }
 
     const url = `${auth.host}/v1/pipelines/?locationId=${encodeURIComponent(locationId)}`;
-    const headers = {
-      Authorization: `Bearer ${auth.token}`,
-      Version: "2021-07-28",
-      Accept: "application/json"
-    };
+    const r = await callPipelines(url, auth.token, auth.isJWT, locationId);
 
-    let r;
-    try {
-      r = await fetch(url, { headers });
-    } catch (netErr) {
-      console.error("FETCH_ERROR:", netErr);
-      return res.status(502).json({ ok: false, error: "Network error contacting GHL", detail: String(netErr) });
-    }
-
-    let data = {};
-    try {
-      data = await r.json();
-    } catch (parseErr) {
-      console.error("JSON_PARSE_ERROR:", parseErr);
-      const text = await r.text().catch(() => "<no-body>");
-      return res.status(r.ok ? 200 : r.status).json({
-        ok: r.ok,
-        status: r.status,
-        error: "Failed to parse JSON from GHL",
-        bodyText: text
-      });
-    }
-
-    return res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, data });
+    let data; try { data = await r.json(); } catch { data = { raw: await r.text().catch(()=>"<no-body>") }; }
+    return res.status(r.ok ? 200 : r.status).json({ ok:r.ok, status:r.status, data });
   } catch (e) {
-    console.error("UNHANDLED_ERROR:", e);
-    return res.status(500).json({ ok: false, error: "Unhandled server error", detail: String(e) });
+    return res.status(500).json({ ok:false, error:"Unhandled server error", detail:String(e) });
   }
 };
+

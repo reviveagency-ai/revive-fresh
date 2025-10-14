@@ -1,24 +1,32 @@
 // api/ghl/opportunities.js
 const { getAuth, getLocationIdFromReq } = require("../_config");
 
-async function call(url, token, isJWT, locationId) {
+function buildOppsUrl(host, isJWT, locationId, q) {
+  const params = new URLSearchParams();
+  if (!isJWT) params.set("locationId", locationId); // API-key mode only
+  if (q.pipelineId) params.set("pipelineId", q.pipelineId);
+  if (q.limit) params.set("limit", q.limit);
+  if (q.startAfterId) params.set("startAfterId", q.startAfterId);
+  return `${host}/v1/opportunities/?${params.toString()}`;
+}
+
+async function fetchOpps(url, token, isJWT, locationId) {
+  const base = { Accept: "application/json", Version: "2021-07-28" };
+
   if (isJWT) {
     return fetch(url, {
       headers: {
+        ...base,
         Authorization: `Bearer ${token}`,
         "Location-Id": locationId,
-        Version: "2021-07-28",
-        Accept: "application/json"
+        "LocationId": locationId
       }
     });
   }
-  let r = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}`, Version: "2021-07-28", Accept: "application/json" }
-  });
+
+  let r = await fetch(url, { headers: { ...base, Authorization: `Bearer ${token}` } });
   if (r.status === 401) {
-    r = await fetch(url, {
-      headers: { "X-API-KEY": token, Version: "2021-07-28", Accept: "application/json" }
-    });
+    r = await fetch(url, { headers: { ...base, "X-API-KEY": token } });
   }
   return r;
 }
@@ -31,17 +39,16 @@ module.exports = async (req, res) => {
     const locationId = getLocationIdFromReq(req);
     if (!locationId) return res.status(400).json({ ok: false, error: "Missing locationId." });
 
-    const params = new URLSearchParams({ locationId });
-    if (req.query.pipelineId) params.set("pipelineId", req.query.pipelineId);
-    if (req.query.limit) params.set("limit", req.query.limit);
-    if (req.query.startAfterId) params.set("startAfterId", req.query.startAfterId);
+    const url = buildOppsUrl(auth.host, auth.isJWT, locationId, req.query || {});
+    const r = await fetchOpps(url, auth.token, auth.isJWT, locationId);
 
-    const url = `${auth.host}/v1/opportunities/?${params.toString()}`;
-    const r = await call(url, auth.token, auth.isJWT, locationId);
+    let body;
+    try { body = await r.json(); }
+    catch { body = { raw: await r.text().catch(() => "<no-body>") }; }
 
-    let data; try { data = await r.json(); } catch { data = { raw: await r.text().catch(()=>"<no-body>") }; }
-    return res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, data });
+    return res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, data: body });
   } catch (e) {
     return res.status(500).json({ ok: false, error: "Unhandled server error", detail: String(e) });
   }
 };
+

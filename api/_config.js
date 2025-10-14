@@ -1,3 +1,4 @@
+// api/_config.js
 function parseLocationEnv() {
   const raw = process.env.LOCATION_IDS || process.env.RYZE_LOCATION_IDS || "";
   const parts = raw.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
@@ -9,6 +10,7 @@ function parseLocationEnv() {
   }
   return { ids, byAlias };
 }
+
 function getAuth() {
   const token = process.env.HL_API_TOKEN || process.env.GHL_API_KEY || process.env.HL_API_KEY;
   if (!token) return { ok: false, error: "Missing HL_API_TOKEN or GHL_API_KEY" };
@@ -16,6 +18,7 @@ function getAuth() {
   const host = isJWT ? "https://services.leadconnectorhq.com" : "https://rest.gohighlevel.com";
   return { ok: true, token, isJWT, host };
 }
+
 function getLocationIdFromReq(req) {
   const q = req.query || {};
   const { ids, byAlias } = parseLocationEnv();
@@ -25,6 +28,7 @@ function getLocationIdFromReq(req) {
   if (ids.length > 0) return ids[0];
   return null;
 }
-function redactedToken(t){ if(!t) return null; return t.length<=10?"***":`${t.slice(0,5)}…${t.slice(-3)}`; }
-module.exports = { getAuth, getLocationIdFromReq, parseLocationEnv, redactedToken };
 
+function redactedToken(t){ if(!t) return null; return t.length<=10?"***":`${t.slice(0,5)}…${t.slice(-3)}`; }
+
+module.exports = { getAuth, getLocationIdFromReq, parseLocationEnv, redactedToken };
